@@ -9,7 +9,7 @@
 - 💬 **NEW: WhatsApp section (admin)** — sidebar me `💬 WhatsApp`:
   - 📱 **Order Alert Number input** — number daal ke 💾 Save karo (Firebase `site/whatsapp` me) + 🧪 Test button
   - 🔗 **WhatsApp Link System embed** — QR connect page wahin iframe me (ya "Open in new tab ↗")
-- 🔔 **Auto order notification** — admin panel khula ho to naya order aate hi saved number pe professional WhatsApp message jata hai (items, total, payment, address + **Google Map link** ke saath)
+- 🔔 **Auto order notification** — admin **logged-in** ho aur website (**menu ya admin panel**, kisi bhi page pe) khuli ho, to naya order aate hi saved number pe professional WhatsApp message jata hai (items, total, payment, address + **Google Map link** ke saath). Server orderId se **dedup** karta hai — multiple tabs/browsers open ho to bhi message **sirf ek baar** jayega
 - 📱 **QR Connect** — WhatsApp → Linked Devices → Link a Device se scan, realtime Socket.IO status
 - ✅ Manual send — connected hone ke baad Phone (+91 default, 40+ countries) + Message inputs
 
@@ -75,8 +75,8 @@ Render → **New + → Web Service** → repo → Build: `npm install` → Start
 
 ## ⚠️ Notes / limitations
 
-- **Render free tier:** restart/redeploy pe WhatsApp session wipe hota hai → dobara QR scan. Permanent ke liye Disk add karke env `AUTH_DIR=/data/wa-auth` lagao
-- **Order alert tabhi jayega jab:** (a) admin panel open hoga, (b) WhatsApp connected hoga, (c) number saved hoga — warna console me warning aati hai
+- **Server restart/redeploy pe session as-is resume:** server start hote hi saved auth folder se WhatsApp apne aap dobara connect ho jata hai (bina QR scan). Render pe **Disk** add karke (`/data/wa-auth`) session permanently bhi rakh sakte ho — server `/data` khud detect karta hai (render.yaml me instructions hain). Free plan pe disk nahi lagta → redeploy ke baad dobara QR scan
+- **Order alert tabhi jayega jab:** (a) admin ka account **logged-in** ho aur website khuli ho — **chahe menu page ya admin panel**, (b) WhatsApp connected hoga, (c) number saved hoga — warna console me warning aati hai
 - Number format: `+91XXXXXXXXXX` ya seedha 10 digit (`+91` apne aap lagta hai) — Firestore doc: `site/whatsapp { notifyNumber }`
 - Agar food menu kisi aur host pe ho (alag origin) to Firestore `site/whatsapp.serverUrl` me WhatsApp server ka URL daal do (empty = same origin)
 - **WhatsApp ToS:** apne hi orders/customers ke liye use karo, spam nahi
@@ -87,6 +87,7 @@ Render → **New + → Web Service** → repo → Build: `npm install` → Start
 | Method | Endpoint | Kaam |
 |---|---|---|
 | GET | `/api/status` | status + QR (`x-pin` agar ACCESS_PIN set hai) |
-| POST | `/api/send` | `{ phone: "+91...", message: "..." }` |
+| POST | `/api/send` | `{ phone: "+91...", message: "..." }` (manual send) |
+| POST | `/api/notify` | `{ orderId, phone, message }` — order alert, orderId se dedup (sirf ek baar) |
 | POST | `/api/connect` / `/api/logout` | session start / unlink |
 | WS | Socket.IO `state` | realtime `{ status, qr, user }` |

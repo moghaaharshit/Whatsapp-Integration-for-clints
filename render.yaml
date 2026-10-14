@@ -6,3 +6,20 @@ services:
     startCommand: npm start
 # ACCESS PIN (optional security) Render ke Dashboard > Environment tab me
 # manually add karo: ACCESS_PIN = <koi 4-6 digit pin>
+#
+# ── WhatsApp session persist rakhne ke liye (server restart/redeploy pe bhi ──
+# ── connect as-is resume rahe, dobara QR scan na karna pade):              ──
+# Render Dashboard → is service ka "Disks" tab → Add Disk:
+#   Name:      wa-auth
+#   Mount Path: /data/wa-auth
+#   Size:      1 GB
+# Server /data ko khud detect kar leta hai (AUTH_DIR env set karne ki
+# zaroorat nahi). Note: Disks Render ke PAID plan pe available hain — free
+# plan pe restart/redeploy ke baad dobara QR scan karna padega.
+#
+# Paid plan ho to ye block uncomment karke disk blueprint se bhi bana sakte ho:
+#
+# disk:
+#   name: wa-auth
+#   mountPath: /data/wa-auth
+#   sizeGB: 1

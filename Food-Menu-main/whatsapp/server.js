@@ -17,9 +17,14 @@ const {
 // Config
 // ---------------------------------------------------------------------------
 const PORT = Number(process.env.PORT) || 3000
-// WhatsApp session files yahan save hote hain (Render pe redeploy karne par
-// wipe ho jata hai -> dobara QR scan karna padta hai)
-const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, '.wa-auth')
+// WhatsApp session files yahan save hote hain. Server start (restart/redeploy)
+// pe agar auth files maujud hain to session apne aap as-is resume hota hai -
+// dobara QR scan ki zaroorat nahi.
+// Render pe Disk mount karne par (/data/wa-auth) wo khud detect ho jata hai,
+// warna local .wa-auth/ folder use hota hai.
+const AUTH_DIR = process.env.AUTH_DIR
+  || (fs.existsSync('/data') ? '/data/wa-auth' : path.join(__dirname, '.wa-auth'))
+try { fs.mkdirSync(AUTH_DIR, { recursive: true }) } catch (_) {}
 // Food menu project (ek folder upar) + WhatsApp connect page
 const FOOD_DIR = path.join(__dirname, '..')
 const FOOD_PAGE = path.join(FOOD_DIR, 'index.html')
@@ -54,6 +59,58 @@ const push = () => io.emit('state', snapshot())
 function pinOk(pin) {
   if (!ACCESS_PIN) return true
   return String(pin || '') === ACCESS_PIN
+}
+
+// ---------------------------------------------------------------------------
+// Order-alert dedup: ek order ka alert sirf EK baar bhejo, chahe admin ke
+// kitne bhi tabs/browsers khule hon (server hi decide karta hai)
+// ---------------------------------------------------------------------------
+const notifiedOrders = new Map() // orderId -> sentAt (ms)
+const NOTIFY_TTL = 48 * 60 * 60 * 1000 // 48 ghante baad bhool jao
+
+function alreadyNotified(orderId) {
+  const now = Date.now()
+  if (notifiedOrders.size > 500) {
+    for (const [id, t] of notifiedOrders) if (now - t > NOTIFY_TTL) notifiedOrders.delete(id)
+  }
+  const t = notifiedOrders.get(orderId)
+  return t !== undefined && now - t < NOTIFY_TTL
+}
+
+function markNotified(orderId) {
+  notifiedOrders.set(orderId, Date.now())
+}
+
+// Phone number normalize + validate -> full digits (ya null)
+function normalizePhone(raw, countryCode) {
+  const s = String(raw || '').trim()
+  const digits = s.replace(/\D/g, '')
+  if (!digits) return null
+  // Agar "+" se shuru hua to wahi final number, warna country code prefix hoga
+  const full = s.startsWith('+') ? digits : String(countryCode || '+91').replace(/\D/g, '') + digits
+  if (!/^\d{7,15}$/.test(full)) return null
+  return full
+}
+
+// WhatsApp pe actual delivery - connected check + existence probe + send
+async function deliverText(full, text) {
+  if (!sock || wa.status !== 'connected') {
+    return { ok: false, status: 400, error: 'Pehle WhatsApp connect kariye (QR scan kariye).' }
+  }
+  const jid = full + '@s.whatsapp.net'
+
+  // Number WhatsApp par hai ya nahi - check karo (best effort)
+  try {
+    const check = await sock.onWhatsApp(jid)
+    if (Array.isArray(check) && check.length && check[0] && check[0].exists === false) {
+      return { ok: false, status: 404, error: '+' + full + ' WhatsApp par nahi hai.' }
+    }
+  } catch (_) { /* check fail ho to bhi send try karenge */ }
+
+  const sent = await sock.sendMessage(jid, { text })
+  const id = sent && sent.key && sent.key.id
+  console.log('[wa] message sent -> +' + full + ' id=' + id)
+  return { ok: true, id: id || null, to: '+' + full }
 }
 
 function apiGuard(req, res, next) {
@@ -228,43 +285,51 @@ app.post('/api/send', apiGuard, async (req, res) => {
   try {
     const body = req.body || {}
     const text = String(body.message || '').trim()
-    const raw = String(body.phone || '').trim()
-    const cc = String(body.countryCode || '+91').replace(/\D/g, '')
 
     if (!text) return res.status(400).json({ ok: false, error: 'Message khaali hai.' })
     if (text.length > 4096) {
       return res.status(400).json({ ok: false, error: 'Message 4096 characters se chhota rakhiye.' })
     }
 
-    const inputDigits = raw.replace(/\D/g, '')
-    if (!inputDigits) return res.status(400).json({ ok: false, error: 'Phone number daaliye.' })
+    const full = normalizePhone(body.phone, body.countryCode)
+    if (!String(body.phone || '').trim()) return res.status(400).json({ ok: false, error: 'Phone number daaliye.' })
+    if (!full) return res.status(400).json({ ok: false, error: 'Number galat lag raha hai (7-15 digits hone chahiye).' })
 
-    // Agar "+" se shuru hua to wahi final number, warna country code prefix hoga
-    const full = raw.startsWith('+') ? inputDigits : cc + inputDigits
-    if (!/^\d{7,15}$/.test(full)) {
-      return res.status(400).json({ ok: false, error: 'Number galat lag raha hai (7-15 digits hone chahiye).' })
-    }
-
-    if (!sock || wa.status !== 'connected') {
-      return res.status(400).json({ ok: false, error: 'Pehle WhatsApp connect kariye (QR scan kariye).' })
-    }
-
-    const jid = full + '@s.whatsapp.net'
-
-    // Number WhatsApp par hai ya nahi - check karo (best effort)
-    try {
-      const check = await sock.onWhatsApp(jid)
-      if (Array.isArray(check) && check.length && check[0] && check[0].exists === false) {
-        return res.status(404).json({ ok: false, error: '+' + full + ' WhatsApp par nahi hai.' })
-      }
-    } catch (_) { /* check fail ho to bhi send try karenge */ }
-
-    const sent = await sock.sendMessage(jid, { text })
-    const id = sent && sent.key && sent.key.id
-    console.log('[wa] message sent -> +' + full + ' id=' + id)
-    res.json({ ok: true, id: id || null, to: '+' + full })
+    const r = await deliverText(full, text)
+    res.status(r.ok ? 200 : r.status).json(r)
   } catch (e) {
     console.error('[api] send error', e)
+    res.status(500).json({ ok: false, error: 'Message nahi bheja: ' + String((e && e.message) || e) })
+  }
+})
+
+// Order-alert endpoint: admin ka browser (menu ya admin panel - kisi bhi page
+// pe) naya order detect karke yahan bhejta hai. orderId se dedup -> sirf EK
+// message jayega, chahe admin ke kitne bhi tabs/browsers khule hon.
+app.post('/api/notify', apiGuard, async (req, res) => {
+  try {
+    const body = req.body || {}
+    const text = String(body.message || '').trim()
+    const orderId = String(body.orderId || '').trim()
+
+    if (!text) return res.status(400).json({ ok: false, error: 'Message khaali hai.' })
+    if (text.length > 4096) {
+      return res.status(400).json({ ok: false, error: 'Message 4096 characters se chhota rakhiye.' })
+    }
+
+    const full = normalizePhone(body.phone, body.countryCode)
+    if (!full) return res.status(400).json({ ok: false, error: 'Number galat lag raha hai (7-15 digits hone chahiye).' })
+
+    // Dedup: ye order pehle hi kisi aur tab/browser se notify ho chuka hai
+    if (orderId && alreadyNotified(orderId)) {
+      return res.json({ ok: true, deduped: true, to: '+' + full })
+    }
+
+    const r = await deliverText(full, text)
+    if (r.ok && orderId) markNotified(orderId)
+    res.status(r.ok ? 200 : r.status).json(r)
+  } catch (e) {
+    console.error('[api] notify error', e)
     res.status(500).json({ ok: false, error: 'Message nahi bheja: ' + String((e && e.message) || e) })
   }
 })
@@ -290,5 +355,8 @@ process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e)
 
 server.listen(PORT, () => {
   console.log('Server chal raha hai -> http://localhost:' + PORT)
+  console.log('[wa] auth dir ->', AUTH_DIR, '(yahan session save hota hai — restart pe yahi se resume)')
+  // Boot pe saved session apne aap resume: agar auth files maujud hain to
+  // bina QR scan ke WhatsApp connect ho jayega, warna naya QR generate hoga.
   startWa().catch((e) => console.error('[wa] start failed:', e && e.message))
 })

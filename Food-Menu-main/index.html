@@ -6072,6 +6072,17 @@
     }
 
     /* ─── WHATSAPP ORDER ALERT HELPERS ─── */
+    // WhatsApp server pe ACCESS_PIN set ho to (localStorage wa_pin — WhatsApp
+    // connect page wahin save karta hai) har request me x-pin bhejo
+    function waApiHeaders() {
+      const h = { 'Content-Type': 'application/json' };
+      try {
+        const p = localStorage.getItem('wa_pin') || '';
+        if (p) h['x-pin'] = p;
+      } catch (e) { }
+      return h;
+    }
+
     function waSanitizeText(v) {
       return String(v == null ? '' : v).replace(/[*_~`]/g, '').trim();
     }
@@ -6124,13 +6135,15 @@
         const base = String(cfg.serverUrl || '').replace(/\/+$/, '');
         for (const order of orders) {
           try {
-            const res = await fetch(base + '/api/send', {
+            // /api/notify: orderId dedup server pe hota hai — admin ke kitne bhi
+            // tabs/browsers khule ho, message sirf ek baar jayega
+            const res = await fetch(base + '/api/notify', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ phone, message: buildOrderWhatsAppMessage(order) })
+              headers: waApiHeaders(),
+              body: JSON.stringify({ orderId: order.id, phone, message: buildOrderWhatsAppMessage(order) })
             });
             const data = await res.json().catch(() => ({}));
-            if (data.ok) console.log('[WhatsApp] Order alert sent ->', data.to, 'order:', order.id);
+            if (data.ok) console.log('[WhatsApp] Order alert ' + (data.deduped ? '(already sent)' : 'sent') + ' ->', data.to, 'order:', order.id);
             else console.warn('[WhatsApp] Order alert failed:', data.error || ('HTTP ' + res.status));
           } catch (e) {
             console.warn('[WhatsApp] Order alert error:', e && e.message);
@@ -6163,7 +6176,7 @@
         let alive = true;
         const check = async () => {
           try {
-            const r = await fetch('/api/status');
+            const r = await fetch('/api/status', { headers: waApiHeaders() });
             if (!alive) return;
             if (r.status === 401) { setWaStatus({ status: 'pin' }); return; }
             const j = await r.json();
@@ -6207,7 +6220,7 @@
         try {
           const res = await fetch('/api/send', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: waApiHeaders(),
             body: JSON.stringify({ phone: normalized, message: '✅ Test alert — CRISP AND CLOUD WhatsApp notifications working!' })
           });
           const data = await res.json().catch(() => ({}));
@@ -6335,8 +6348,8 @@
             });
             if (hasNewOrder) {
               showOrderNotification();
-              // 💬 Saved number pe WhatsApp order alert bhejo
-              sendOrderWhatsAppAlerts(newOrders);
+              // 💬 WhatsApp alert App (root) level pe chalta hai — admin panel
+              // ya menu, kisi bhi page pe ho tab bhi notification jayegi
             }
           });
 
@@ -6501,6 +6514,37 @@
         });
         return unsub;
       }, []);
+
+      // 💬 WhatsApp order-alert listener — ROOT level, sirf admin ke liye.
+      // Admin logged-in hai aur website khuli hai (menu HO ya admin panel HO),
+      // naya order aate hi saved number pe WhatsApp alert chali jayegi.
+      // (Server /api/notify pe orderId dedup karta hai — multiple tabs ya
+      // panel-dono-page pe ho to bhi message sirf ek baar jayega)
+      useEffect(() => {
+        if (userRole !== 'admin') return undefined;
+        let initialSnapshot = true;
+        const knownOrderIds = new Set();
+        const unsub = fbDb.collection('orders')
+          .where('status', 'in', ['pending', 'served', 'completed', 'rejected'])
+          .onSnapshot(snap => {
+            if (initialSnapshot) {
+              // Purane orders (jo pehle se Firestore me hain) ko skip karo —
+              // sirf is session me aaye naye orders ka alert bhejna hai
+              snap.forEach(doc => knownOrderIds.add(doc.id));
+              initialSnapshot = false;
+              return;
+            }
+            const newOrders = [];
+            snap.docChanges().forEach(change => {
+              if (change.type === 'added' && !knownOrderIds.has(change.doc.id)) {
+                knownOrderIds.add(change.doc.id);
+                newOrders.push({ id: change.doc.id, ...change.doc.data() });
+              }
+            });
+            if (newOrders.length) sendOrderWhatsAppAlerts(newOrders);
+          }, err => console.warn('[WhatsApp] orders listener error:', err && err.message));
+        return unsub;
+      }, [userRole]);
 
       const [pageLoading, setPageLoading] = useState(false);
 
