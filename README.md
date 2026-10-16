@@ -22,7 +22,8 @@ Food-Menu-main/
 ├── manifest.json, order.mp3, img1/2.png, logo.png
 └── whatsapp/
     ├── index.html          → WhatsApp Link System page (React CDN + QR)
-    └── server.js           → Express + Socket.IO + Baileys server
+    ├── server.js           → Express + Socket.IO + Baileys server
+    └── session-store.js    → WhatsApp session persistence (Firestore / local file)
 package.json                → npm start (server yahan se chalta hai)
 render.yaml                 → Render blueprint
 ```
@@ -73,9 +74,37 @@ Render → **New + → Web Service** → repo → Build: `npm install` → Start
 
 > ⚠️ **ACCESS PIN** (recommended): Render → Environment → `ACCESS_PIN` = koi 4-6 digit pin. Bina pin ke koi bhi link pe aakar tumhara WhatsApp session use kar sakta hai.
 
+## ☁️ Session Firebase (Firestore) me — free plan pe bhi restart/redeploy ke baad connected
+
+WhatsApp connect karte hi session **Firestore** me save ho jaata hai → server restart/redeploy hone pe bhi bina QR scan ke wahi session dobara connect ho jaata hai. Setup (2 min):
+
+1. Firebase Console → ⚙️ Project settings → **Service accounts** → **Generate new private key** → JSON file download
+2. Render → is service → **Environment** → 2 env vars add karo:
+   - `FIREBASE_SERVICE_ACCOUNT` = pura service account JSON (ek value me, ya base64) — ya JSON file ho to `FIREBASE_SERVICE_ACCOUNT_FILE` = path
+   - (optional) `WA_SESSION_KEY` = koi secret passphrase → session AES-256-GCM se encrypt hoke store hoga
+3. Firestore **Rules** me ye collection browser clients se bilkul band rakho (session = tumhara WhatsApp account):
+
+```js
+match /waSessions/{doc} { allow read, write: if false; }
+```
+
+**Kaise kaam karta hai:**
+
+- Server start → Firestore doc (`waSessions/default`) se session padhta hai → saved creds hote hi bina QR scan ke reconnect
+- Firestore me session na mile aur local `.wa-auth/` me purana session ho to wo **ek baar apne aap migrate** ho jaata hai (dobara scan nahi)
+- Session har `creds.update` par save hota hai (keys 1.5s debounce me) + SIGTERM/SIGINT (Render deploy/restart) pe flush ho jaata hai
+- Firestore reachable nahi (creds galat/network) → warning ke saath **local file mode** pe fallback (purana behaviour)
+- Logout / phone se unlink → Firestore doc bhi delete (naya QR scan hoga)
+- Extra env (rarely badalne wale): `WA_SESSION_COLLECTION` (default `waSessions`), `WA_SESSION_DOC` (default `default`)
+- ⚠️ Service account key aur `WA_SESSION_KEY` kabhi public/repo me mat daalo; rules upar waisi hi rakho
+
+> Pehli baar env set karne ke baad: agar `.wa-auth/` me already connected session hai to bina scan ke Firestore me chala jayega, warna ek baar QR scan karna padega (uske baad permanent).
+
+**Yaani free plan pe bhi session permanent** — Render Disk ab optional hai. Disk wala tarika bhi chalta hai (neeche), dono me se ek hi chuno: Firestore set ho to Firestore hi use hota hai.
+
 ## ⚠️ Notes / limitations
 
-- **Server restart/redeploy pe session as-is resume:** server start hote hi saved auth folder se WhatsApp apne aap dobara connect ho jata hai (bina QR scan). Render pe **Disk** add karke (`/data/wa-auth`) session permanently bhi rakh sakte ho — server `/data` khud detect karta hai (render.yaml me instructions hain). Free plan pe disk nahi lagta → redeploy ke baad dobara QR scan
+- **Server restart/redeploy pe session as-is resume:** `FIREBASE_SERVICE_ACCOUNT` set ho to session Firestore me save rehta hai — free plan pe bhi redeploy ke baad bina QR scan ke reconnect (upar ☁️ section). Bina Firebase ke: local auth folder se resume hota hai; Render pe **Disk** add karke (`/data/wa-auth`) bhi rakh sakte ho — server `/data` khud detect karta hai (render.yaml me instructions). Free plan pe disk nahi lagta → bina env/disk ke redeploy ke baad dobara QR scan
 - **Order alert tabhi jayega jab:** (a) admin ka account **logged-in** ho aur website khuli ho — **chahe menu page ya admin panel**, (b) WhatsApp connected hoga, (c) number saved hoga — warna console me warning aati hai
 - Number format: `+91XXXXXXXXXX` ya seedha 10 digit (`+91` apne aap lagta hai) — Firestore doc: `site/whatsapp { notifyNumber }`
 - Agar food menu kisi aur host pe ho (alag origin) to Firestore `site/whatsapp.serverUrl` me WhatsApp server ka URL daal do (empty = same origin)

@@ -7,6 +7,18 @@ services:
 # ACCESS PIN (optional security) Render ke Dashboard > Environment tab me
 # manually add karo: ACCESS_PIN = <koi 4-6 digit pin>
 #
+# ── WhatsApp session Firestore me (restart/redeploy ke baad bhi connected) ──
+# Firebase Console → Project settings → Service accounts → Generate new
+# private key (JSON) → wo pura JSON Render ke Environment tab me as a single
+# env var paste karo:
+#   FIREBASE_SERVICE_ACCOUNT = <service account JSON>
+# Optional (session ko AES-256-GCM se encrypt karne ke liye):
+#   WA_SESSION_KEY = <koi secret passphrase>
+# Firestore Rules me collection ko clients se lock rakho (session = WhatsApp
+# account):
+#   match /waSessions/{doc} { allow read, write: if false; }
+# Ye set ho to Disk ki zaroorat NAHI — session Firestore me save hota hai.
+#
 # ── WhatsApp session persist rakhne ke liye (server restart/redeploy pe bhi ──
 # ── connect as-is resume rahe, dobara QR scan na karna pade):              ──
 # Render Dashboard → is service ka "Disks" tab → Add Disk:

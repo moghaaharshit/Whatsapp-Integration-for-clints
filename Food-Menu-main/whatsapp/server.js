@@ -8,10 +8,10 @@ const { Server } = require('socket.io')
 const pino = require('pino')
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys')
+const sessionStore = require('./session-store')
 
 // ---------------------------------------------------------------------------
 // Config
@@ -140,7 +140,10 @@ async function startWa() {
   wa.user = null
   push()
 
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+  // Session store: FIREBASE_SERVICE_ACCOUNT set ho to session Firestore me save
+  // hoga (restart/redeploy ke baad bhi bina QR scan ke reconnect), warna local
+  // .wa-auth/ folder — pehle jaisa.
+  const { state, saveCreds } = await sessionStore.getAuthState(AUTH_DIR)
 
   let version
   try { ({ version } = await fetchLatestBaileysVersion()) } catch (_) {}
@@ -207,15 +210,16 @@ function handleUpdate(u) {
 
     if (intentionalClose) return
 
-    // Logged out = session dead -> auth wipe karke fresh QR generate karo
-    if (loggedOut) {
-      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch (_) {}
-    }
+    // Logged out = session dead -> auth wipe (local folder + Firestore doc)
+    // karke fresh QR generate karo
+    const wipe = loggedOut
+      ? sessionStore.clearSession(AUTH_DIR).catch((e) => console.error('[wa] session wipe failed:', e && e.message))
+      : Promise.resolve()
 
     if (!restartTimer) {
       restartTimer = setTimeout(() => {
         restartTimer = null
-        startWa().catch((e) => console.error('[wa] restart failed:', e && e.message))
+        wipe.then(() => startWa()).catch((e) => console.error('[wa] restart failed:', e && e.message))
       }, loggedOut ? 1500 : 4000)
     }
   }
@@ -224,9 +228,12 @@ function handleUpdate(u) {
 // ---------------------------------------------------------------------------
 // Pages: Food menu (root) + WhatsApp system (/whatsapp)
 // ---------------------------------------------------------------------------
-// Server ke internal files static serving se block karo
+// Server ke internal files static serving se block karo — server.js,
+// session-store.js, package.json, .wa-auth/ (session!) ye sab kabhi expose
+// nahi honge. /whatsapp/index.html (.html) hi serve hota hai.
 app.use((req, res, next) => {
-  if (/^\/whatsapp\/(server\.js|package[^/]*\.json|node_modules)/.test(req.path)) {
+  const p = req.path
+  if (p.startsWith('/whatsapp/') && (/\.js$|\.json$/i.test(p) || p.includes('/.wa-auth'))) {
     return res.status(404).end()
   }
   next()
@@ -270,7 +277,7 @@ app.post('/api/logout', apiGuard, async (req, res) => {
   try { if (old) old.end(undefined) } catch (_) {}
   intentionalClose = false
 
-  try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch (_) {}
+  try { await sessionStore.clearSession(AUTH_DIR) } catch (e) { console.error('[wa] clearSession', e && e.message) }
 
   wa.status = 'disconnected'
   wa.qr = null
@@ -352,6 +359,18 @@ io.on('connection', (socket) => {
 // ---------------------------------------------------------------------------
 process.on('uncaughtException', (e) => console.error('[uncaughtException]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e))
+
+// Deploy/restart (SIGTERM/SIGINT) pe pending session write Firestore me flush ho
+// jaaye — warna restart ke thodi pehle ki last save reh sakti hai.
+const shutdown = (sig) => {
+  console.log('[server] ' + sig + ' mila — session flush kar rahe hain...')
+  setTimeout(() => process.exit(0), 5000) // flush hang ho to bhi exit
+  sessionStore.flushSessionWrites()
+    .catch(() => {})
+    .then(() => process.exit(0))
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 server.listen(PORT, () => {
   console.log('Server chal raha hai -> http://localhost:' + PORT)

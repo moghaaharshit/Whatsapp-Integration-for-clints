@@ -13,6 +13,7 @@
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.24",
     "express": "^4.22.3",
+    "firebase-admin": "^14.5.0",
     "pino": "^10.4.0",
     "socket.io": "^4.8.4"
   }
