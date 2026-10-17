@@ -6083,6 +6083,40 @@
       return h;
     }
 
+    /* ─── WhatsApp session localStorage backup ───
+       Connected hone pe server se session blob localStorage me save hota hai.
+       Render server restart/redeploy ke baad session wipe ho jata hai (free
+       plan pe disk nahi) — tab admin panel khulte hi backup wapas server ko
+       bhej diya jata hai → bina QR scan ke automatic reconnect. */
+    const WA_BACKUP_KEY = 'wa_session_backup';
+    const WA_RESTORE_KEY = 'wa_session_restore';
+
+    function waReadSessionBackup() {
+      try { return JSON.parse(localStorage.getItem(WA_BACKUP_KEY) || 'null'); } catch (e) { return null; }
+    }
+
+    function waSaveSessionBackup(session, rev) {
+      try {
+        localStorage.setItem(WA_BACKUP_KEY, JSON.stringify({ session: session, rev: rev, savedAt: Date.now() }));
+        localStorage.removeItem(WA_RESTORE_KEY); // naya backup = restore attempts reset
+        return true;
+      } catch (e) { return false; } // quota full hoga
+    }
+
+    // Throttle: 6 ghante me max 3 restore attempts — purana/galat backup ho to
+    // infinite QR-import loop nahi banega (backup nayi hoti hi counter reset).
+    function waRestoreAttemptAllowed() {
+      try {
+        const now = Date.now();
+        let t = JSON.parse(localStorage.getItem(WA_RESTORE_KEY) || 'null');
+        if (!t || now - t.at > 6 * 60 * 60 * 1000) t = { at: now, n: 0 };
+        if (t.n >= 3) return false;
+        t.n += 1;
+        localStorage.setItem(WA_RESTORE_KEY, JSON.stringify(t));
+        return true;
+      } catch (e) { return true; }
+    }
+
     function waSanitizeText(v) {
       return String(v == null ? '' : v).replace(/[*_~`]/g, '').trim();
     }
@@ -6544,6 +6578,54 @@
             if (newOrders.length) sendOrderWhatsAppAlerts(newOrders);
           }, err => console.warn('[WhatsApp] orders listener error:', err && err.message));
         return unsub;
+      }, [userRole]);
+
+      // 💬 WhatsApp session localStorage sync — ROOT level, sirf admin ke liye.
+      // 1) Server connected hai → session blob localStorage me save (rev change par).
+      // 2) Server ke paas session nahi (Render restart/deploy) aur QR/disconnected
+      //    dikh raha hai → admin panel khulte hi backup wapas bhej kar auto-reconnect.
+      useEffect(() => {
+        if (userRole !== 'admin') return undefined;
+        let alive = true;
+        let busy = false;
+        const check = async () => {
+          if (!alive || busy) return;
+          busy = true;
+          try {
+            const r = await fetch('/api/status', { headers: waApiHeaders() });
+            if (!alive || r.status === 401) return;
+            const j = await r.json().catch(() => null);
+            if (!alive || !j || !j.status) return;
+            const backup = waReadSessionBackup();
+            if (j.sessionPresent && j.status === 'connected') {
+              // Server ke paas latest session hai → agar rev badla hai to naya backup lo
+              if (!backup || backup.rev !== j.sessionRev) {
+                const er = await fetch('/api/session/export', { headers: waApiHeaders() });
+                if (!alive) return;
+                const d = er.ok ? await er.json().catch(() => null) : null;
+                if (d && d.ok && d.session) {
+                  const saved = waSaveSessionBackup(d.session, d.rev);
+                  if (saved) console.log('[WhatsApp] session backup saved (rev ' + d.rev + ')');
+                }
+              }
+            } else if (!j.sessionPresent && (j.status === 'qr' || j.status === 'disconnected') && backup && backup.session) {
+              // Server session kho chuka hai (restart) → localStorage backup wapas bhejo
+              if (!waRestoreAttemptAllowed()) return;
+              const ir = await fetch('/api/session/import', {
+                method: 'POST', headers: waApiHeaders(),
+                body: JSON.stringify({ data: backup.session })
+              });
+              const d = await ir.json().catch(() => null);
+              if (!alive) return;
+              if (d && d.ok) console.log('[WhatsApp] session restore -> server (saving wali session, bina QR)');
+              else console.warn('[WhatsApp] session restore fail:', d && d.error);
+            }
+          } catch (e) { /* offline — agla tick retry karega */ }
+          finally { busy = false; }
+        };
+        check();
+        const t = setInterval(check, 15000);
+        return () => { alive = false; clearInterval(t); };
       }, [userRole]);
 
       const [pageLoading, setPageLoading] = useState(false);

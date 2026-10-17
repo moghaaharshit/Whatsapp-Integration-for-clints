@@ -46,6 +46,9 @@ const fixFileName = (file) => file?.replace(/\//g, '__')?.replace(/:/g, '-')
 // Har naye auth state ke baad purane state ke late writes Firestore doc ko na
 // clobber karein — isliye epoch guard.
 let storeEpoch = 0
+// localStorage backup (export) ke liye latest plain snapshot — Firestore mode
+// me buildState isko har schedule par update karta hai.
+let latestPlain = null
 
 // ─── codec: session blob ↔ string ───────────────────────────────────────────────
 // Note: change-detection hamesha plain JSON par hota hai (enc me random IV hota
@@ -158,6 +161,7 @@ function buildState({ files, write } = {}) {
   const schedule = (immediate) => {
     if (isStale()) return
     pending = snapshot()
+    latestPlain = pending
     if (immediate) return flush()
     if (!timer) {
       timer = setTimeout(() => {
@@ -339,6 +343,10 @@ async function getAuthState(authDir) {
       const doc = await readSessionDoc()
       const { files, migrated } = filesFromDoc(doc, authDir)
       if (migrated) console.log('[session] local session Firestore me migrate ho raha hai (dobara scan nahi lagega)')
+      if (files && files['creds.json']) {
+        // export (localStorage backup) turant available rahe — creds update se pehle bhi
+        latestPlain = JSON.stringify({ v: 1, files })
+      }
 
       const ref = db.collection(COLLECTION).doc(DOC_ID)
       const st = buildState({
@@ -372,6 +380,7 @@ async function getAuthState(authDir) {
 // Logout / logged-out: session dono jagah se mitao (Firestore doc + local folder)
 async function clearSession(authDir) {
   storeEpoch++ // purane state ke late writes ab kuch save nahi karenge
+  latestPlain = null
   try {
     await resolveMode()
   } catch (_) {}
@@ -393,10 +402,91 @@ function flushSessionWrites() {
   return currentFlush ? currentFlush() : Promise.resolve()
 }
 
+// ─── localStorage session backup (browser → server restore) ────────────────────
+// exportSession: running/local session ka encoded blob — admin browser ise
+// localStorage me save rakhta hai (Render restart/redeploy ke liye backup).
+function exportSession(authDir) {
+  let plain = null
+  if (mode === 'firestore' && latestPlain) {
+    plain = latestPlain
+  } else {
+    // file mode (ya firestore fallback): disk hi source of truth
+    const files = loadLocalFiles(authDir)
+    if (files && files['creds.json']) plain = JSON.stringify({ v: 1, files })
+  }
+  if (!plain) return null
+  try {
+    const payload = JSON.parse(plain)
+    const credsRaw = payload && payload.files && payload.files['creds.json']
+    if (!credsRaw) return null
+    const creds = JSON.parse(credsRaw)
+    if (!creds || !(creds.registered || creds.me)) return null // fresh/unpaired session backup karne layak nahi
+  } catch (_) {
+    return null
+  }
+  return encodeJson(plain)
+}
+
+// importSession: browser ke localStorage backup se session wapas restore —
+// files -> AUTH_DIR (replace) + Firestore mode ho to doc bhi overwrite.
+async function importSession(authDir, raw) {
+  const s = String(raw || '')
+  if (!s || s.length > 4 * 1024 * 1024) throw new Error('Session backup khaali ya bahut bada hai.')
+
+  const payload = decodeSession(s) // plain:v1 / enc:v1 / seedha JSON — sab chalta hai
+  if (!payload || typeof payload !== 'object' || !payload.files || typeof payload.files !== 'object') {
+    throw new Error('Session backup ka format galat hai.')
+  }
+
+  // Har file ka naam safe hona chahiye (path traversal se bachna)
+  const files = {}
+  for (const [rawName, val] of Object.entries(payload.files)) {
+    if (typeof val !== 'string') continue
+    const name = fixFileName(String(rawName))
+    if (!name || !name.endsWith('.json') || name.includes('..') || /[\\/]/.test(name)) continue
+    try { JSON.parse(val) } catch (_) { throw new Error('Session file corrupt hai: ' + name) }
+    files[name] = val
+  }
+
+  const credsRaw = files['creds.json']
+  if (!credsRaw) throw new Error('Backup me creds.json nahi hai.')
+  let creds
+  try { creds = JSON.parse(credsRaw) } catch (_) { throw new Error('creds.json parse nahi hua.') }
+  if (!creds || !(creds.registered || creds.me)) throw new Error('Backup me registered session nahi hai (QR scan wali nayi session?).')
+
+  storeEpoch++ // purane running state ke late writes ab imported session ko clobber nahi karenge
+  try { fs.rmSync(authDir, { recursive: true, force: true }) } catch (_) {}
+  fs.mkdirSync(authDir, { recursive: true })
+  for (const [name, val] of Object.entries(files)) fs.writeFileSync(path.join(authDir, name), val, 'utf8')
+  latestPlain = JSON.stringify({ v: 1, files })
+  console.log('[session] localStorage backup restore: ' + Object.keys(files).length + ' files -> ' + authDir)
+
+  // Firestore mode: doc ko bhi overwrite (doc pe preferred hai). Fail ho to
+  // local folder fallback file mode / migration path se kaam chalta rahega.
+  try {
+    await resolveMode()
+    if (mode === 'firestore' && db) {
+      const stored = encodeJson(latestPlain)
+      await db.collection(COLLECTION).doc(DOC_ID).set({
+        data: stored,
+        enc: Boolean(PASSPHRASE),
+        size: Buffer.byteLength(stored),
+        updatedAt: FieldValue.serverTimestamp()
+      })
+      console.log('[session] imported backup -> Firestore doc overwrite')
+    }
+  } catch (e) {
+    console.warn('[session] Firestore import write fail — local folder me backup saved hai:', e && e.message)
+  }
+  return { ok: true, files: Object.keys(files).length }
+}
+
 module.exports = {
   getAuthState,
   clearSession,
   flushSessionWrites,
+  exportSession,
+  importSession,
   // testing ke liye
   encodeSession,
   decodeSession,

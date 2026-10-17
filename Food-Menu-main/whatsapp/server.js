@@ -46,12 +46,19 @@ const wa = { status: 'disconnected', qr: null, user: null }
 let sock = null
 let intentionalClose = false
 let restartTimer = null
+let waEpoch = 0 // overlapping startWa calls me last-wins guarantee
+// localStorage session backup ke liye: kya server ke paas registered session
+// hai (disk/Firestore), aur uska rev (change hote hi client naya backup lega)
+let sessionPresent = false
+let sessionRev = 0
 
 const snapshot = () => ({
   status: wa.status,
   qr: wa.qr,
   user: wa.user,
   pinRequired: Boolean(ACCESS_PIN),
+  sessionPresent,
+  sessionRev
 })
 
 const push = () => io.emit('state', snapshot())
@@ -123,6 +130,9 @@ function apiGuard(req, res, next) {
 // Baileys socket
 // ---------------------------------------------------------------------------
 async function startWa() {
+  // Agar boot ke startWa ke beech me /api/session/import dobara startWa bulaye
+  // to purana (stale/state-possibly-empty) instance naye ko overwrite NA kare.
+  const myEpoch = ++waEpoch
   if (restartTimer) {
     clearTimeout(restartTimer)
     restartTimer = null
@@ -144,6 +154,10 @@ async function startWa() {
   // hoga (restart/redeploy ke baad bhi bina QR scan ke reconnect), warna local
   // .wa-auth/ folder — pehle jaisa.
   const { state, saveCreds } = await sessionStore.getAuthState(AUTH_DIR)
+  if (myEpoch !== waEpoch) return // naya startWa already aage nikal gaya — ye stale hai
+  // Session mil gaya (Firestore/local) → client ko bata do ki backup restore
+  // ki zaroorat nahi hai. Fresh/unpaired creds = QR hi chahiye hoga.
+  sessionPresent = !!(state && state.creds && (state.creds.registered || state.creds.me))
 
   let version
   try { ({ version } = await fetchLatestBaileysVersion()) } catch (_) {}
@@ -166,7 +180,9 @@ async function startWa() {
   // Purane socket ke events ignore ho jaate hain (session replace ho chuka hai)
   s.ev.on('creds.update', (c) => {
     if (sock !== s) return
-    saveCreds(c).catch((e) => console.error('[wa] saveCreds', e && e.message))
+    saveCreds(c)
+      .then(() => { sessionRev++ }) // keys rotate hui → client ko naya backup lena hai
+      .catch((e) => console.error('[wa] saveCreds', e && e.message))
   })
 
   s.ev.on('connection.update', (u) => {
@@ -192,6 +208,8 @@ function handleUpdate(u) {
       id: (sock.user && sock.user.id) || null,
       name: (sock.user && sock.user.name) || null,
     }
+    sessionPresent = true
+    sessionRev++
     push()
     console.log('[wa] connected ->', wa.user.id)
   }
@@ -219,7 +237,10 @@ function handleUpdate(u) {
     if (!restartTimer) {
       restartTimer = setTimeout(() => {
         restartTimer = null
-        wipe.then(() => startWa()).catch((e) => console.error('[wa] restart failed:', e && e.message))
+        wipe.then(() => {
+          if (loggedOut) { sessionPresent = false; sessionRev++ } // purana session wipe ho chuka
+          return startWa()
+        }).catch((e) => console.error('[wa] restart failed:', e && e.message))
       }, loggedOut ? 1500 : 4000)
     }
   }
@@ -278,6 +299,8 @@ app.post('/api/logout', apiGuard, async (req, res) => {
   intentionalClose = false
 
   try { await sessionStore.clearSession(AUTH_DIR) } catch (e) { console.error('[wa] clearSession', e && e.message) }
+  sessionPresent = false
+  sessionRev++
 
   wa.status = 'disconnected'
   wa.qr = null
@@ -286,6 +309,41 @@ app.post('/api/logout', apiGuard, async (req, res) => {
 
   try { await startWa() } catch (e) { console.error('[wa] restart after logout', e && e.message) }
   res.json(snapshot())
+})
+
+// ── localStorage session backup (Render restart/redeploy safety) ──
+// export: connected session ka encoded blob — admin browser ise localStorage
+// me save rakhta hai. import: server (fresh instance) ke paas session nahi to
+// browser admin panel khulte hi backup wapas bhejta hai → bina QR ke reconnect.
+app.get('/api/session/export', apiGuard, (req, res) => {
+  try {
+    const blob = sessionStore.exportSession(AUTH_DIR)
+    res.json({ ok: true, session: blob || null, rev: sessionRev })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) })
+  }
+})
+
+app.post('/api/session/import', apiGuard, async (req, res) => {
+  try {
+    const data = String((req.body || {}).data || '')
+    if (!data) return res.status(400).json({ ok: false, error: 'Session backup khaali hai.' })
+    if (data.length > 4 * 1024 * 1024) {
+      return res.status(400).json({ ok: false, error: 'Session backup 4MB se chhota hona chahiye.' })
+    }
+    // Server pehle se connected session ke saath chal raha — backup ki zaroorat nahi
+    if (sessionPresent && wa.status === 'connected') {
+      return res.json({ ok: true, skipped: true, ...snapshot() })
+    }
+    const r = await sessionStore.importSession(AUTH_DIR, data)
+    sessionPresent = true
+    sessionRev++
+    // Imported session leke reconnect — saved creds ke saath bina QR ke connect
+    await startWa()
+    res.json({ ok: true, files: r.files, ...snapshot() })
+  } catch (e) {
+    res.status(400).json({ ok: false, error: String((e && e.message) || e) })
+  }
 })
 
 app.post('/api/send', apiGuard, async (req, res) => {

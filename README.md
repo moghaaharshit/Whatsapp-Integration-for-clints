@@ -102,6 +102,16 @@ match /waSessions/{doc} { allow read, write: if false; }
 
 **Yaani free plan pe bhi session permanent** — Render Disk ab optional hai. Disk wala tarika bhi chalta hai (neeche), dono me se ek hi chuno: Firestore set ho to Firestore hi use hota hai.
 
+## 📦 localStorage session backup (bina Firebase bhi chalega)
+
+Agar `FIREBASE_SERVICE_ACCOUNT` set **nahi** hai (free plan, koi env nahi) to bhi ab session restart se bachta hai — **admin ke browser localStorage** me backup hoke:
+
+- **Save:** admin logged-in ho aur WhatsApp connected ho → server har session-change (`sessionRev` badalne) pe `/api/session/export` se encoded session blob admin ke browser me `wa_session_backup` localStorage key pe save karta hai (15s poll)
+- **Restore:** Render restart/redeploy ke baad server session-khali boot karta hai (QR dikhata hai) → admin panel kholte hi client `/api/session/import` se backup wapas bhejta hai → server imported session leke **bina QR scan ke automatic reconnect**
+- **Safety:** restore par 6 ghante me max 3 attempts (purane/galat backup se QR loop nahi banega) — naya backup save hote hi counter reset; blob server pe bhi PIN (`ACCESS_PIN`) se guarded hai
+- ⚠️ **Limitation:** restore tabhi chalega jab **same browser** (usi localStorage wala) admin panel khole — naya browser/device ho to `wa_session_backup` nahi hoga. Bada saftaban: localStorage = browser ke andar WhatsApp creds (XSS = session chori) — isliye `ACCESS_PIN` + Firestore rules ka dhyan rakho. Backup bahut purana (phone se unlink) hoga to import fail → wapas QR aayega (normal)
+- **Dono ek saath bhi chalte hain:** Firestore set ho to server boot pe pehle Firestore se padhta hai (browser ko import hi nahi karna padta), localStorage sirf fallback rahega
+
 ## ⚠️ Notes / limitations
 
 - **Server restart/redeploy pe session as-is resume:** `FIREBASE_SERVICE_ACCOUNT` set ho to session Firestore me save rehta hai — free plan pe bhi redeploy ke baad bina QR scan ke reconnect (upar ☁️ section). Bina Firebase ke: local auth folder se resume hota hai; Render pe **Disk** add karke (`/data/wa-auth`) bhi rakh sakte ho — server `/data` khud detect karta hai (render.yaml me instructions). Free plan pe disk nahi lagta → bina env/disk ke redeploy ke baad dobara QR scan
@@ -120,3 +130,5 @@ match /waSessions/{doc} { allow read, write: if false; }
 | POST | `/api/notify` | `{ orderId, phone, message }` — order alert, orderId se dedup (sirf ek baar) |
 | POST | `/api/connect` / `/api/logout` | session start / unlink |
 | WS | Socket.IO `state` | realtime `{ status, qr, user }` |
+| GET | `/api/session/export` | encoded session blob + rev (localStorage backup) |
+| POST | `/api/session/import` | `{ data }` — browser se session restore (restart ke baad auto-reconnect) |
