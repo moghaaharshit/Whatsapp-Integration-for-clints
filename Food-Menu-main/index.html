@@ -3788,6 +3788,11 @@
       color: #c62828;
     }
 
+    .order-status-badge.ordered {
+      background: #e3f2fd;
+      color: #1565c0;
+    }
+
     .order-items-list {
       border-top: 1px solid #f5f5f5;
       padding-top: 12px;
@@ -5258,6 +5263,15 @@
               batch.delete(doc.ref);
               return;
             }
+            // Ordered (WhatsApp alert successful gaya): 24 ghante baad
+            // user ki history se bhi delete ho jao
+            if (d.status === 'ordered') {
+              const orderedMs = d.notifiedAt ? d.notifiedAt.toMillis() : (d.createdAt ? d.createdAt.toMillis() : 0);
+              if (orderedMs && now - orderedMs > 24 * 60 * 60 * 1000) {
+                batch.delete(doc.ref);
+                return;
+              }
+            }
             // Completed: delete after 1 hour
             if (d.status === 'completed') {
               const completedMs = d.completedAt ? d.completedAt.toMillis() : (d.createdAt ? d.createdAt.toMillis() : 0);
@@ -5281,7 +5295,7 @@
         return unsub;
       }, [user]);
 
-      const statusLabel = { pending: '⏳ Pending', served: '🚚 Shipped', completed: '✅ Order Completed', rejected: '❌ Rejected' };
+      const statusLabel = { ordered: '📩 Ordered', pending: '⏳ Pending', served: '🚚 Shipped', completed: '✅ Order Completed', rejected: '❌ Rejected' };
 
       return (
         <div className="orders-page">
@@ -5645,10 +5659,19 @@
       const autoCleanup = async () => {
         const now = Date.now();
         const cutoff = now - (1 * 60 * 60 * 1000); // 1 hour
-        const snap = await fbDb.collection('orders').where('status', 'in', ['completed', 'rejected']).get();
+        const orderedCutoff = now - (24 * 60 * 60 * 1000); // 24 hours
+        const snap = await fbDb.collection('orders').where('status', 'in', ['completed', 'rejected', 'ordered']).get();
         const batch = fbDb.batch();
         snap.forEach(doc => {
           const d = doc.data();
+          // Ordered (WhatsApp alert gaya): 24 ghante baad poori tarah delete —
+          // chahe customer apna orders page kabhi khole ya na khole.
+          if (d.status === 'ordered') {
+            const orderedMs = d.notifiedAt ? d.notifiedAt.toMillis() : (d.createdAt ? d.createdAt.toMillis() : 0);
+            if (orderedMs && orderedMs < orderedCutoff) batch.delete(doc.ref);
+            return;
+          }
+          // Completed/rejected purana (1 ghante se) → delete (existing behaviour)
           const ts = d.completedAt ? d.completedAt.toMillis() : (d.createdAt ? d.createdAt.toMillis() : 0);
           if (ts < cutoff) batch.delete(doc.ref);
         });
@@ -6177,8 +6200,21 @@
               body: JSON.stringify({ orderId: order.id, phone, message: buildOrderWhatsAppMessage(order) })
             });
             const data = await res.json().catch(() => ({}));
-            if (data.ok) console.log('[WhatsApp] Order alert ' + (data.deduped ? '(already sent)' : 'sent') + ' ->', data.to, 'order:', order.id);
-            else console.warn('[WhatsApp] Order alert failed:', data.error || ('HTTP ' + res.status));
+            if (data.ok) {
+              console.log('[WhatsApp] Order alert ' + (data.deduped ? '(already sent)' : 'sent') + ' ->', data.to, 'order:', order.id);
+              // ✅ WhatsApp message successfully send ho gaya → order ko
+              // 'ordered' par set kar do (merge). Admin panel sirf
+              // pending/served/completed/rejected dikhata hai, isliye order
+              // wahin se apne aap gayab ho jayega — doc delete NAHI hota,
+              // customer ko apni history 'ordered' status ke sath milti
+              // rahegi (jo 24 ghante baad clean hoti hai).
+              // ⚠️ Message fail hua to status pending hi rahega → order panel
+              // me dikhta rahega (visible rehna chahiye jab tak message na jaye).
+              await fbDb.collection('orders').doc(order.id).set(
+                { status: 'ordered', notifiedAt: firebase.firestore.FieldValue.serverTimestamp() },
+                { merge: true }
+              );
+            } else console.warn('[WhatsApp] Order alert failed:', data.error || ('HTTP ' + res.status));
           } catch (e) {
             console.warn('[WhatsApp] Order alert error:', e && e.message);
           }
